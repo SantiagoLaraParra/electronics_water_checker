@@ -1,0 +1,202 @@
+import board
+import displayio
+import busio
+import terminalio
+import analogio
+import time
+import i2cdisplaybus
+import adafruit_displayio_sh1106
+from adafruit_display_text import label
+import digitalio
+
+# --- 1. SETUP DISPLAY (SH1106) ---
+displayio.release_displays()
+i2c = busio.I2C(board.GP1, board.GP0)  # SCL=GP1, SDA=GP0
+display_bus = i2cdisplaybus.I2CDisplayBus(i2c, device_address=0x3C)
+display = adafruit_displayio_sh1106.SH1106(
+    display_bus, width=128, height=64, colstart=2
+)
+
+# UI Setup
+main_group = displayio.Group()
+display.root_group = main_group
+
+# Create Labels
+title_label = label.Label(terminalio.FONT, text="WATER MONITOR", x=20, y=7)
+ph_label = label.Label(terminalio.FONT, text="", x=5, y=22)
+tds_label = label.Label(terminalio.FONT, text="", x=5, y=36)
+turb_label = label.Label(terminalio.FONT, text="", x=5, y=50)
+status_label = label.Label(terminalio.FONT, text="", x=5, y=60)
+
+for i in [title_label, ph_label, tds_label, turb_label, status_label]:
+    main_group.append(i)
+# --- 2. SETUP SENSORS & NAVIGATION CONTROLS ---
+tds_sensor = analogio.AnalogIn(board.A3)  # GP29
+ph_sensor = analogio.AnalogIn(board.A1)  # GP27
+turb_sensor = analogio.AnalogIn(board.A0)  # GP26
+
+# Menu Control Inputs (Configured to your exact pin changes)
+btn_confirm = digitalio.DigitalInOut(board.GP2)
+btn_confirm.direction = digitalio.Direction.INPUT
+btn_confirm.pull = digitalio.Pull.UP
+
+btn_back = digitalio.DigitalInOut(board.GP3)
+btn_back.direction = digitalio.Direction.INPUT
+btn_back.pull = digitalio.Pull.UP
+
+rotary_cw = digitalio.DigitalInOut(board.GP6)
+rotary_cw.direction = digitalio.Direction.INPUT
+rotary_cw.pull = digitalio.Pull.UP
+
+rotary_ccw = digitalio.DigitalInOut(board.GP7)
+rotary_ccw.direction = digitalio.Direction.INPUT
+rotary_ccw.pull = digitalio.Pull.UP
+
+# Calibration Constants
+VREF = 3.3
+TEMP = 25.0
+NEUTRAL_VOLTAGE = 1.76  # pH 7.0
+PH_SLOPE = 0.18  # Volts per pH
+CLEAR_THRESHOLD = 1.55
+DIRTY_THRESHOLD = 0.9
+
+# State Machine Variables
+STATE_MENU = 0
+STATE_MEASURE = 1
+current_state = STATE_MENU
+
+# Menu Options
+MENU_ALL = 0
+MENU_PH = 1
+MENU_TDS = 2
+MENU_TURB = 3
+menu_selection = MENU_ALL
+menu_options = [
+    "Measure All",
+    "Measure pH Only",
+    "Measure TDS Only",
+    "Measure Turb Only",
+]
+
+# Hardware tracking helpers
+last_cw_status = rotary_cw.value
+last_ccw_status = rotary_ccw.value
+last_button_time = 0
+
+# --- 3. HELPER & SENSOR FUNCTIONS ---
+def get_voltage(pin):
+    return (pin.value * VREF) / 65520
+
+
+def get_ph():
+    samples = 50
+    raw_sum = 0
+    for _ in range(samples):
+        raw_sum += ph_sensor.value
+    avg_voltage = ((raw_sum / samples) * VREF) / 65535
+    ph_val = 7 - ((NEUTRAL_VOLTAGE - avg_voltage) / PH_SLOPE)
+    return ph_val
+
+
+def get_tds_value(voltage):
+    comp_coeff = 1.0 + 0.02 * (TEMP - 25.0)
+    comp_v = voltage / comp_coeff
+    tds = (133.42 * comp_v ** 3 - 255.86 * comp_v ** 2 + 857.39 * comp_v) * 0.5
+    return round(tds, 1)
+
+
+def debounce():
+    """Simple software debounce for button/rotary presses."""
+    global last_button_time
+    current_time = time.monotonic()
+    if (current_time - last_button_time) > 0.2:  # 200ms debounce
+        last_button_time = current_time
+        return True
+    return False
+
+
+def update_display_labels(mode):
+    """Calculates data and sets visibility/text based on menu selection."""
+    v_tds = get_voltage(tds_sensor)
+    v_turb = get_voltage(turb_sensor)
+    current_ph = get_ph()
+    ppm = get_tds_value(v_tds)
+
+    # Status Logic
+    p_stat = (
+        "ACIDIC" if current_ph < 5.5 else ("ALKALINE" if current_ph > 7.0 else "SAFE")
+    )
+    t_stat = (
+        "CLEAN"
+        if v_turb >= CLEAR_THRESHOLD
+        else ("CLOUDY" if v_turb >= DIRTY_THRESHOLD else "DIRTY")
+    )
+
+    # Mode 0: All sensors
+    if mode == MENU_ALL:
+        ph_label.text = f"pH:  {current_ph:.2f} ({p_stat})"
+        tds_label.text = f"TDS: {ppm} PPM"
+        turb_label.text = f"Turb: {v_turb:.2f}V"
+        status_label.text = f"Water: {t_stat}"
+    # Mode 1: pH Only
+    elif mode == MENU_PH:
+        ph_label.text = f"pH: {current_ph:.2f}"
+        tds_label.text = f"Status: {p_stat}"
+        turb_label.text = ""
+        status_label.text = ""
+    # Mode 2: TDS Only
+    elif mode == MENU_TDS:
+        ph_label.text = f"TDS: {ppm} PPM"
+        tds_label.text = ""
+        turb_label.text = ""
+        status_label.text = ""
+    # Mode 3: Turbidity Only
+    elif mode == MENU_TURB:
+        ph_label.text = f"Turbidity: {v_turb:.2f}V"
+        tds_label.text = f"Status: {t_stat}"
+        turb_label.text = ""
+        status_label.text = ""
+
+
+# --- 4. MAIN LOOP ---
+while True:
+    # --- STATE: NAVIGATING THE MENU ---
+    if current_state == STATE_MENU:
+        title_label.text = "SELECT MODE"
+        tds_label.text = ""
+        turb_label.text = ""
+        status_label.text = "[ Confirm -> ]"
+
+        # Read Clockwise Step (GP6)
+        current_cw_status = rotary_cw.value
+        if current_cw_status != last_cw_status and current_cw_status == 0:
+            if debounce():
+                menu_selection = (menu_selection + 1) % len(menu_options)
+        last_cw_status = current_cw_status
+
+        # Read Counter-Clockwise Step (GP7)
+        current_ccw_status = rotary_ccw.value
+        if current_ccw_status != last_ccw_status and current_ccw_status == 0:
+            if debounce():
+                menu_selection = (menu_selection - 1) % len(menu_options)
+        last_ccw_status = current_ccw_status
+
+        # Update text line to show chosen option dynamically
+        ph_label.text = f"> {menu_options[menu_selection]}"
+
+        # Check Confirm Button (GP2)
+        if btn_confirm.value == 0 and debounce():
+            current_state = STATE_MEASURE
+            title_label.text = menu_options[menu_selection].upper()
+            display.refresh()
+    # --- STATE: ACTIVELY RUNNING MEASUREMENTS ---
+    elif current_state == STATE_MEASURE:
+        # Run sensor processing logic based on user selection
+        update_display_labels(menu_selection)
+
+        # Check Back Button (GP3)
+        if btn_back.value == 0 and debounce():
+            current_state = STATE_MENU
+            display.refresh()
+        time.sleep(0.2)  # Faster updates while tracking data
+    time.sleep(0.01)  # Keeps loop responsive
